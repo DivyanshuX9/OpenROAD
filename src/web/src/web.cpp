@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <exception>
 #include <fstream>
 #include <functional>
 #include <ios>
@@ -28,11 +29,16 @@
 #include "boost/beast/core.hpp"
 #include "boost/beast/http.hpp"
 #include "boost/beast/websocket.hpp"
+#include "boost/json/array.hpp"
+#include "boost/json/object.hpp"
+#include "boost/json/serialize.hpp"
+#include "boost/json/value.hpp"
 #include "clock_tree_report.h"
 #include "gui/heatMap.h"
 #include "hierarchy_report.h"
-#include "json_builder.h"
 #include "odb/db.h"
+#include "odb/dbBlockCallBackObj.h"
+#include "odb/dbChipCallBackObj.h"
 #include "request_dispatcher.h"
 #include "request_handler.h"
 #include "tcl.h"
@@ -112,7 +118,9 @@ static http::response<http::string_body> handle_request(
 // WebSocket session - multiplexes many requests over a single connection
 //------------------------------------------------------------------------------
 
-class WebSocketSession : public std::enable_shared_from_this<WebSocketSession>
+class WebSocketSession : public std::enable_shared_from_this<WebSocketSession>,
+                         public odb::dbChipCallBackObj,
+                         public odb::dbBlockCallBackObj
 {
   websocket::stream<beast::tcp_stream> websocket_;
   beast::flat_buffer buffer_;
@@ -168,6 +176,42 @@ class WebSocketSession : public std::enable_shared_from_this<WebSocketSession>
   void queue_response(const WebSocketResponse& resp,
                       std::function<void()> on_complete = {});
   void do_write();
+
+  void inDbMarkerCategoryCreate(odb::dbMarkerCategory*) override
+  {
+    WebSocketResponse resp;
+    resp.type = WebSocketResponse::kJson;
+    const std::string json = R"({"type":"drcUpdated"})";
+    resp.payload.assign(json.begin(), json.end());
+    queue_response(resp);
+  }
+
+  void inDbMarkerCategoryDestroy(odb::dbMarkerCategory*) override
+  {
+    WebSocketResponse resp;
+    resp.type = WebSocketResponse::kJson;
+    const std::string json = R"({"type":"drcUpdated"})";
+    resp.payload.assign(json.begin(), json.end());
+    queue_response(resp);
+  }
+
+  void inDbMarkerCreate(odb::dbMarker*) override
+  {
+    WebSocketResponse resp;
+    resp.type = WebSocketResponse::kJson;
+    const std::string json = R"({"type":"drcUpdated"})";
+    resp.payload.assign(json.begin(), json.end());
+    queue_response(resp);
+  }
+
+  void inDbMarkerDestroy(odb::dbMarker*) override
+  {
+    WebSocketResponse resp;
+    resp.type = WebSocketResponse::kJson;
+    const std::string json = R"({"type":"drcUpdated"})";
+    resp.payload.assign(json.begin(), json.end());
+    queue_response(resp);
+  }
 };
 
 WebSocketSession::WebSocketSession(
@@ -192,6 +236,17 @@ WebSocketSession::WebSocketSession(
       generator_(std::move(generator)),
       viewer_hook_(viewer_hook)
 {
+  if (generator_) {
+    odb::dbChip* chip = generator_->getChip();
+    if (chip) {
+      odb::dbChipCallBackObj::addOwner(chip);
+      odb::dbBlock* block = chip->getBlock();
+      if (block) {
+        odb::dbBlockCallBackObj::addOwner(block);
+      }
+    }
+  }
+
   if (generator_->getBlock()) {
     tile_handler_.initializeHeatMaps(state_);
   }
@@ -235,44 +290,47 @@ WebSocketSession::WebSocketSession(
         WebSocketResponse resp;
         resp.id = req.id;
         resp.type = WebSocketResponse::kJson;
-        JsonBuilder builder;
-        builder.beginObject();
-        builder.beginArray("charts");
+        boost::json::object root;
+        boost::json::array charts;
         if (viewer_hook_ != nullptr) {
-          for (WebChart* chart : viewer_hook_->charts()) {
-            builder.beginObject();
-            builder.field("name", chart->name());
-            builder.field("x_label", chart->xLabel());
-            builder.beginArray("y_labels");
+          const auto& hook_charts = viewer_hook_->charts();
+          charts.reserve(hook_charts.size());
+          for (WebChart* chart : hook_charts) {
+            boost::json::object c;
+            c["name"] = chart->name();
+            c["x_label"] = chart->xLabel();
+            boost::json::array y_labels;
             for (const auto& lbl : chart->yLabels()) {
-              builder.value(lbl);
+              y_labels.emplace_back(lbl);
             }
-            builder.endArray();
-            builder.field("x_format", chart->xAxisFormat());
-            builder.beginArray("y_formats");
+            c["y_labels"] = std::move(y_labels);
+            c["x_format"] = chart->xAxisFormat();
+            boost::json::array y_formats;
             for (const auto& f : chart->yAxisFormats()) {
-              builder.value(f);
+              y_formats.emplace_back(f);
             }
-            builder.endArray();
-            builder.beginArray("points");
-            for (const auto& pt : chart->points()) {
-              builder.beginObject();
-              builder.field("x", pt.x);
-              builder.beginArray("ys");
+            c["y_formats"] = std::move(y_formats);
+            boost::json::array points;
+            const auto& chart_points = chart->points();
+            points.reserve(chart_points.size());
+            for (const auto& pt : chart_points) {
+              boost::json::object p;
+              p["x"] = pt.x;
+              boost::json::array ys;
+              ys.reserve(pt.ys.size());
               for (double v : pt.ys) {
-                builder.value(v);
+                ys.emplace_back(v);
               }
-              builder.endArray();
-              builder.endObject();
+              p["ys"] = std::move(ys);
+              points.emplace_back(std::move(p));
             }
-            builder.endArray();
-            builder.endObject();
+            c["points"] = std::move(points);
+            charts.emplace_back(std::move(c));
           }
         }
-        builder.endArray();
-        builder.endObject();
-        const std::string& json = builder.str();
-        resp.payload.assign(json.begin(), json.end());
+        root["charts"] = std::move(charts);
+        std::string s = boost::json::serialize(root);
+        resp.payload.assign(s.begin(), s.end());
         return resp;
       },
       /*run_inline=*/true);
@@ -280,6 +338,16 @@ WebSocketSession::WebSocketSession(
 
 WebSocketSession::~WebSocketSession()
 {
+  if (generator_) {
+    odb::dbChip* chip = generator_->getChip();
+    if (chip) {
+      odb::dbChipCallBackObj::removeOwner();
+      odb::dbBlock* block = chip->getBlock();
+      if (block) {
+        odb::dbBlockCallBackObj::removeOwner();
+      }
+    }
+  }
   if (viewer_hook_ != nullptr && viewer_token_ != 0) {
     viewer_hook_->sessions().remove(viewer_token_);
   }
@@ -370,9 +438,26 @@ void WebSocketSession::on_accept(beast::error_code ec)
     // Only send refresh if there's actually a design to render.
     // Without this guard, eagerInit returns instantly when no block is
     // loaded and the push races with async_accept (Beast soft_mutex crash).
-    if (!self->generator_->getBlock()) {
+    // We gate on the dbChip (not dbBlock) so 3DBlox multi-tech designs
+    // — whose top chip is HIER and has no dbBlock — still register the
+    // chip observer and send the refresh notification.
+    if (!self->generator_->getChip()) {
       return;
     }
+
+    // Re-register chip/block observer if the chip was created after session
+    // construction (e.g. read_def ran after browser connected).
+    if (!self->odb::dbChipCallBackObj::hasOwner()) {
+      odb::dbChip* chip = self->generator_->getChip();
+      if (chip) {
+        self->odb::dbChipCallBackObj::addOwner(chip);
+        odb::dbBlock* block = chip->getBlock();
+        if (block && !self->odb::dbBlockCallBackObj::hasOwner()) {
+          self->odb::dbBlockCallBackObj::addOwner(block);
+        }
+      }
+    }
+
     // Send server-push refresh notification (id=0)
     WebSocketResponse resp;
     resp.id = 0;
@@ -416,14 +501,18 @@ void WebSocketSession::on_read(beast::error_code ec)
   const auto* entry = dispatcher_.find(req.type);
   if (entry != nullptr) {
     if (entry->run_inline) {
-      queue_response(entry->handle(req, state_));
+      auto resp = entry->handle(req, state_);
+      resp.request_type = req.raw_type;
+      queue_response(resp);
     } else {
       auto handle = entry->handle;
       net::post(websocket_.get_executor(),
                 [self = std::move(self),
                  req = std::move(req),
                  handle = std::move(handle)]() {
-                  self->queue_response(handle(req, self->state_));
+                  auto resp = handle(req, self->state_);
+                  resp.request_type = req.raw_type;
+                  self->queue_response(resp);
                 });
     }
   } else {
@@ -432,7 +521,15 @@ void WebSocketSession::on_read(beast::error_code ec)
     WebSocketResponse resp;
     resp.id = req.id;
     resp.type = WebSocketResponse::kError;
-    const std::string err = "Unknown request type";
+    resp.request_type = req.raw_type;
+    std::string err;
+    if (!req.raw_type.empty()) {
+      err = "Unknown request type: " + req.raw_type;
+    } else if (!req.parse_error.empty()) {
+      err = "Malformed request: " + req.parse_error;
+    } else {
+      err = "Malformed request (missing or invalid id/type)";
+    }
     resp.payload.assign(err.begin(), err.end());
     queue_response(resp);
   }
@@ -443,6 +540,23 @@ void WebSocketSession::on_read(beast::error_code ec)
 void WebSocketSession::queue_response(const WebSocketResponse& resp,
                                       std::function<void()> on_complete)
 {
+  // Surface every error response in the server log so contract violations
+  // (malformed payloads, missing fields, wrong field types) are visible to
+  // the operator/developer and not silently swallowed by the client.
+  if (resp.type == WebSocketResponse::kError) {
+    const std::string_view err(
+        reinterpret_cast<const char*>(resp.payload.data()),
+        resp.payload.size());
+    const std::string type_label
+        = resp.request_type.empty() ? "unknown" : resp.request_type;
+    logger_->warn(utl::WEB,
+                  43,
+                  "request id={} type={} failed: {}",
+                  resp.id,
+                  type_label,
+                  err);
+  }
+
   std::vector<unsigned char> frame = serialize_response(resp);
 
   // Post to the strand to serialize write queue access
@@ -864,6 +978,16 @@ WebServer::~WebServer()
   // reactor::shutdown() destroys pending async operations whose
   // handlers reference the dying reactor.  The OS reclaims at exit.
   (void) ioc_.release();  // NOLINT(bugprone-unused-return-value)
+  // Remove the WebLogSink from the Logger before leaking viewer_hook_: the
+  // sink holds a raw pointer into the hook and the CLI thread may still emit
+  // log lines.  In the normal path stop() already did this (log_sink_ is
+  // null here); this covers paths where serve()/stop() never ran — e.g.
+  // initLogger() registered the sink but read_db failed and exited.  logger_
+  // outlives us: ~OpenRoad deletes web_server_ before logger_.
+  if (log_sink_) {
+    logger_->removeSink(log_sink_);
+    log_sink_.reset();
+  }
   // Also leak viewer_hook_ — it may be referenced by Gui's
   // headless_viewer_ pointer which outlives us (static singleton).
   (void) viewer_hook_.release();  // NOLINT(bugprone-unused-return-value)
@@ -873,13 +997,6 @@ WebServer::~WebServer()
 // by embed_report_assets.py → report_assets.cpp).
 extern const std::string_view kReportCSS;
 extern const std::string_view kReportJS;
-
-static std::string serializeToJson(auto serialize_fn)
-{
-  JsonBuilder b;
-  serialize_fn(b);
-  return b.str();
-}
 
 static std::string base64Encode(const std::vector<unsigned char>& data)
 {
@@ -930,34 +1047,26 @@ void WebServer::saveReport(const std::string& filename,
     TimingReport report(sta_);
     setup_paths = report.getReport(true, max_setup);
     hold_paths = report.getReport(false, max_hold);
-    setup_json = serializeToJson(
-        [&](JsonBuilder& b) { serializeTimingPaths(b, setup_paths); });
-    hold_json = serializeToJson(
-        [&](JsonBuilder& b) { serializeTimingPaths(b, hold_paths); });
-    hist_setup = serializeToJson([&](JsonBuilder& b) {
-      serializeSlackHistogram(b, report.getSlackHistogram(true));
-    });
-    hist_hold = serializeToJson([&](JsonBuilder& b) {
-      serializeSlackHistogram(b, report.getSlackHistogram(false));
-    });
-    filters = serializeToJson([&](JsonBuilder& b) {
-      serializeChartFilters(b, report.getChartFilters());
-    });
+    setup_json = boost::json::serialize(serializeTimingPaths(setup_paths));
+    hold_json = boost::json::serialize(serializeTimingPaths(hold_paths));
+    hist_setup = boost::json::serialize(
+        serializeSlackHistogram(report.getSlackHistogram(true)));
+    hist_hold = boost::json::serialize(
+        serializeSlackHistogram(report.getSlackHistogram(false)));
+    filters = boost::json::serialize(
+        serializeChartFilters(report.getChartFilters()));
   } else {
     logger_->warn(utl::WEB, 30, "No STA data — timing sections will be empty.");
-    setup_json
-        = serializeToJson([](JsonBuilder& b) { serializeTimingPaths(b, {}); });
+    setup_json = boost::json::serialize(serializeTimingPaths({}));
     hold_json = setup_json;
-    hist_setup = serializeToJson(
-        [](JsonBuilder& b) { serializeSlackHistogram(b, {}); });
+    hist_setup = boost::json::serialize(serializeSlackHistogram({}));
     hist_hold = hist_setup;
-    filters
-        = serializeToJson([](JsonBuilder& b) { serializeChartFilters(b, {}); });
+    filters = boost::json::serialize(serializeChartFilters({}));
   }
-  const std::string tech_json = serializeToJson(
-      [&](JsonBuilder& b) { serializeTechResponse(b, *generator_); });
-  const std::string bounds_json = serializeToJson(
-      [&](JsonBuilder& b) { serializeBoundsResponse(b, *generator_, true); });
+  const std::string tech_json
+      = boost::json::serialize(serializeTechResponse(*generator_));
+  const std::string bounds_json
+      = boost::json::serialize(serializeBoundsResponse(*generator_, true));
   const auto tech_layers = generator_->getLayers();
 
   // ── Serialize module hierarchy ──
@@ -965,8 +1074,8 @@ void WebServer::saveReport(const std::string& filename,
   HierarchyReport hier_report(block, sta_);
   auto hier_result = hier_report.getReport();
 
-  const std::string hierarchy_json = serializeToJson(
-      [&](JsonBuilder& b) { serializeHierarchyResult(b, hier_result); });
+  const std::string hierarchy_json
+      = boost::json::serialize(serializeHierarchyResult(hier_result));
 
   auto module_colors = computeDefaultModuleColors(hier_result);
   const std::map<uint32_t, Color>* mod_colors_ptr
@@ -1094,13 +1203,15 @@ window.__STATIC_CACHE__ = {
   },
   tiles: {)";
 
-  // Emit tile entries.
+  // Emit tile entries.  Use boost::json::serialize for the key to escape
+  // special characters consistently (the value side is already base64).
   for (size_t i = 0; i < tile_entries.size(); ++i) {
     if (i > 0) {
       out << ",";
     }
-    out << "\n    \"" << json_escape(tile_entries[i].first) << "\":\""
-        << tile_entries[i].second << "\"";
+    out << "\n    "
+        << boost::json::serialize(boost::json::value(tile_entries[i].first))
+        << ":\"" << tile_entries[i].second << "\"";
   }
 
   out << R"(
@@ -1135,6 +1246,7 @@ window.__STATIC_CACHE__ = {
 </script>
 <script type="module">
 import { GoldenLayout, LayoutConfig } from 'https://esm.sh/golden-layout@2.6.0';
+import * as THREE from 'https://esm.sh/three@0.160.0';
 )" << kReportJS
       << R"(
 </script>
@@ -1164,7 +1276,15 @@ void WebServer::saveImage(const std::string& filename,
   const odb::Rect region(x0, y0, x1, y1);
   TileVisibility vis;
   if (!vis_json.empty()) {
-    vis.parseFromJson(vis_json);
+    try {
+      boost::json::value v = boost::json::parse(vis_json);
+      if (auto* obj = v.if_object()) {
+        vis.parseFromJson(*obj);
+      }
+    } catch (const std::exception& e) {
+      logger_->warn(
+          utl::WEB, 42, "Ignoring malformed visibility JSON: {}", e.what());
+    }
   }
   generator_->saveImage(filename, region, width_px, dbu_per_pixel, vis);
 }
